@@ -25,10 +25,10 @@ Details live in [plan.md](plan.md).
 
 ## ADR-4 Plate data: spool, then S3, then report
 
-- **Decision:** After `Run` returns, the driver writes the data to its spool volume and fsyncs it. It then uploads to `runs/<run>/<step>/<n>.csv`, retrying until S3 accepts, and checks the sha256 against the ledger.
+- **Decision:** After `Run` returns, the driver writes the data to its spool volume and fsyncs it. It checks the spooled file's sha256 against the ledger, then uploads to `runs/<run>/<step>/<n>.csv`, retrying until S3 accepts. It does not read the object back from S3.
 - Only then does the driver report. It deletes the spool file after the command is acked. If a redelivered job shows `completed` in the ledger but has no spool file, the attempt fails with "data lost", and the step retries.
 - **Rejected:** Reporting before uploading, because the record would say completed with no data. Keeping the data only in memory, because a crash loses it. Sending the data through the executor, because it would add another hop and the data still has to reach S3.
-- **Consequence:** A step stays `running` while S3 is down, and `data_ref` always points at a verified object. A crash in the few milliseconds between `Run` returning and the fsync costs one re-read; that attempt shows `failed` while the ledger shows `completed`.
+- **Consequence:** A step stays `running` while S3 is down, and `data_ref` always points at an object whose bytes matched the ledger before upload. Nothing in the system reads it back; `check_record.sh` does, after the run. A corrupted write to S3 would go unnoticed until then (untested). A crash in the few milliseconds between `Run` returning and the fsync costs one re-read; that attempt shows `failed` while the ledger shows `completed`.
 
 ## ADR-5 Instruments that cannot look up a job (not built)
 
@@ -44,6 +44,14 @@ Details live in [plan.md](plan.md).
 - **Decision:** The driver publishes `started` on `lab.result.<device>.started` once the ledger has the job, so an attempt shows `dispatched` (queued) or `started` (on the device). On cancel, the executor puts queued attempts' job ids in KV `REVOKED`. The driver checks ledger → `REVOKED` → `Run`, and reports a revoked job as `revoked`, so its step becomes `cancelled`. Drivers send a status every 5s on core NATS. The executor keeps the last one in memory, logs an alert for attempts on a device unheard for 15s, and serves both through GraphQL `devices`.
 - **Rejected:** Deleting a queued command from `CMDS` by sequence, because a driver may already hold it; the driver-side check is needed anyway. Storing liveness in Postgres, because it is about now and every 5s writes would buy nothing. Failing a step when its device goes quiet, because the device may still be working (ADR-2: the ledger decides).
 - **Consequence:** The record tells queued from on the device, and cancel stops queued work before it runs, as a best effort that never makes the record false. An executor older than this reads `started` as a result and fails the step: the executor must be deployed first.
+
+## ADR-7 Where the device queue lives: NATS or an executor lease (proposed, not built)
+
+- **Context:** Today the device queue is the `CMDS` stream: one consumer per device with `MaxAckPending=1` (ADR-3). Three things follow from that. A command queued behind another run's job shows its step as `running` in the HTTP API. Cancel cannot reach a queued command, so ADR-6 added KV `REVOKED`, and that check has a race. And `started` was needed to tell queued from on the device, which brought the deploy-order constraint with it.
+- **Alternative:** The executor holds a lease per device. It dispatches only to a device with no open attempt (`dispatched` or `started`), picking the oldest ready step across runs. Postgres enforces this with a partial unique index on `attempts(device_id)` for open attempts. Steps stay `pending` until they are dispatched. Cancel is a plain database update. `REVOKED` is not needed: the remaining race is publish → driver pickup, milliseconds instead of the whole queue wait, and if it happens the job runs and the record says so. `MaxAckPending=1` stays as a second guard.
+- **Cost:** One round trip between consecutive steps on the same device (result commits, then the next dispatch), milliseconds because a result wakes the loop. Scheduling moves into our code, which is also where priorities and fairness would have to go anyway.
+- **Decision:** Not built for this submission. The NATS queue is built and verified (E13, F11, `check_record.sh`), and replacing it late would put a verified record at risk for a cleaner design. It is the first change I would make next.
+- **Consequence if adopted:** ADR-6 shrinks to `started` and liveness. Invariant 5 gets stricter: at most one open attempt per device. Migration fails on a database that already has more than one open attempt on a device, so it needs a drained queue.
 
 ## Out of scope
 

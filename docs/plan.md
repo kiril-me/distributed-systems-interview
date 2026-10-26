@@ -180,8 +180,8 @@ One loop per device, commands handled one at a time:
    `HANG_DURATION`, and the device stays ours until then. Send `InProgress` while
    waiting.
 5. If the outcome is `completed` and the device produces data:
-   - Spool present: upload, retrying until S3 accepts it, and verify the sha256
-     against the ledger.
+   - Spool present: verify its sha256 against the ledger, then upload,
+     retrying until S3 accepts it. The object is not read back.
    - No spool (crash between `Run` returning and the fsync): report `failed`
      with "data lost after completion".
 6. Publish the result, including the ledger execution fields, and wait for
