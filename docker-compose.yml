@@ -167,6 +167,8 @@ services:
       - PRODUCES_DATA=true
     volumes:
       - ledger:/ledger
+      # Plate data waits here between the read and S3 (docs/decisions.md, ADR-4).
+      - plate-reader-spool:/spool
     depends_on: *driver-deps
     networks:
       lab-network:
@@ -178,6 +180,7 @@ volumes:
   nats_data:
   storage_data:
   ledger:
+  plate-reader-spool:
 
 networks:
   lab-network:

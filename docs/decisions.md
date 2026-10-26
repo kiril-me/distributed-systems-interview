@@ -30,6 +30,21 @@ Details live in [plan.md](plan.md).
 - **Rejected:** Reporting before uploading, because the record would say completed with no data. Keeping the data only in memory, because a crash loses it. Sending the data through the executor, because it would add another hop and the data still has to reach S3.
 - **Consequence:** A step stays `running` while S3 is down, and `data_ref` always points at a verified object. A crash in the few milliseconds between `Run` returning and the fsync costs one re-read; that attempt shows `failed` while the ledger shows `completed`.
 
+## ADR-5 Instruments that cannot look up a job (not built)
+
+- **Context:** ADR-2 rests on the instrument recording our `JobID` and letting the driver look it up. This one does. Real instruments often don't: they run a protocol and report nothing about it afterwards.
+- **Decision, if we meet one:** the driver keeps its own write-ahead log. It appends "about to run `job_id`" and fsyncs before calling `Run`, and "ended, outcome X" after. On a redelivery it reads its log instead of the instrument's ledger.
+- A log entry with a start and no end means the driver died during the job and nobody knows what happened physically. A retryable device treats it as hung: the attempt fails and retries. A non-retryable device (liquid handler) reports `unknown`: the step fails and is never run again without a person, because a second dispense on a part-dispensed plate is worse than a failed step.
+- Where the device has any state to read (a plate barcode, a door sensor, a volume reading), the driver uses it to turn `unknown` into an outcome.
+- **Rejected:** Running again on redelivery. That is at-least-once on the physical device, which the liquid handler can't afford.
+- **Consequence:** At most once per attempt for non-retryable devices, at the cost of a person deciding the rare unknown. The record says `unknown` rather than guessing.
+
+## ADR-6 Between dispatch and result: queued, on device, revoked, offline
+
+- **Decision:** The driver publishes `started` on `lab.result.<device>.started` once the ledger has the job, so an attempt shows `dispatched` (queued) or `started` (on the device). On cancel, the executor puts queued attempts' job ids in KV `REVOKED`. The driver checks ledger → `REVOKED` → `Run`, and reports a revoked job as `revoked`, so its step becomes `cancelled`. Drivers send a status every 5s on core NATS. The executor keeps the last one in memory, logs an alert for attempts on a device unheard for 15s, and serves both through GraphQL `devices`.
+- **Rejected:** Deleting a queued command from `CMDS` by sequence, because a driver may already hold it; the driver-side check is needed anyway. Storing liveness in Postgres, because it is about now and every 5s writes would buy nothing. Failing a step when its device goes quiet, because the device may still be working (ADR-2: the ledger decides).
+- **Consequence:** The record tells queued from on the device, and cancel stops queued work before it runs, as a best effort that never makes the record false. An executor older than this reads `started` as a result and fails the step: the executor must be deployed first.
+
 ## Out of scope
 
 HA executor, Temporal, graceful shutdown.

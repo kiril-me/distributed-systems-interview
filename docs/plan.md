@@ -213,7 +213,7 @@ One loop per device, commands handled one at a time:
    attempt's instrument times.
 9. Attempt numbers are consecutive and stay within `max_attempts`.
 
-Planned: `scripts/check-record.sh` compares `/runs/{id}` with `:7101-7103/status`.
+Planned: `scripts/check_record.sh` compares `/runs/{id}` with `:7101-7103/status`.
 
 ## Failure scenarios and how to trigger them
 
