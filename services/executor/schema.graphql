@@ -1,0 +1,173 @@
+"""
+The run record, for scientists and tools. Served at POST /graphql.
+
+Following a run is done by polling run(id). There are no subscriptions, on
+purpose: polling a read that is always one consistent snapshot is enough, and
+it needs nothing beyond HTTP.
+
+Errors carry extensions.code: NOT_FOUND (no such run, workflow or cursor),
+INVALID_STATE (the run cannot do that now) or BAD_INPUT (an argument out of
+range). run(id) returns null rather than an error when the run does not exist.
+"""
+schema {
+  query: Query
+  mutation: Mutation
+}
+
+scalar Time
+
+type Query {
+  run(id: ID!): Run
+  "Newest first. first is 1 to 200; after is the endCursor of the previous page."
+  runs(status: RunStatus, first: Int = 50, after: ID): RunConnection!
+  workflows: [Workflow!]!
+  "Every device a workflow names or a driver reported, by id."
+  devices: [Device!]!
+}
+
+type Mutation {
+  """
+  Creates a run of the named workflow, or of the default one when omitted.
+  With idempotencyKey, a retry returns the run the first call created instead
+  of creating another. The same key for another workflow is BAD_INPUT.
+  """
+  createRun(workflowName: String, idempotencyKey: String): Run!
+  "Starts a pending run. INVALID_STATE otherwise."
+  startRun(id: ID!): Run!
+  "Stops new work: pending steps close, running steps end as they physically end. INVALID_STATE once the run is finished or a cancel was already requested."
+  cancelRun(id: ID!): Run!
+}
+
+enum RunStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum StepStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+"""
+DISPATCHED: queued for the device. STARTED: the instrument's ledger has it,
+it is on the device. REVOKED: the run was cancelled while it was queued, and
+it never ran. A result can end a DISPATCHED attempt directly when the start
+notice was lost.
+"""
+enum AttemptStatus {
+  DISPATCHED
+  STARTED
+  COMPLETED
+  FAILED
+  REVOKED
+}
+
+"How the instrument's ledger says an execution ended."
+enum InstrumentOutcome {
+  COMPLETED
+  FAILED
+  HUNG
+}
+
+type RunConnection {
+  nodes: [Run!]!
+  pageInfo: PageInfo!
+}
+
+type PageInfo {
+  endCursor: ID
+  hasNextPage: Boolean!
+}
+
+type Run {
+  id: ID!
+  workflowName: String!
+  status: RunStatus!
+  "Cancel was asked for. The run stays RUNNING until its running steps end."
+  cancelRequested: Boolean!
+  createdAt: Time!
+  startedAt: Time
+  finishedAt: Time
+  steps: [Step!]!
+}
+
+type Step {
+  name: String!
+  deviceId: String!
+  dependsOn: [String!]!
+  dependencies: [Step!]!
+  """
+  RUNNING means the work is on the device or queued for it; the last
+  attempt's status tells which. A plate read stays RUNNING until its data is
+  in S3.
+  """
+  status: StepStatus!
+  "The last attempt's instrument times. startedAt is set once it is on the device."
+  startedAt: Time
+  finishedAt: Time
+  error: String
+  "Where the data is, as s3://bucket/key. Only steps that produce data."
+  dataRef: String
+  "Oldest first."
+  attempts: [Attempt!]!
+}
+
+"One command for one step. Its instrument fields come from the ledger."
+type Attempt {
+  n: Int!
+  "<run_id>/<step>/<n>, the same id the instrument's ledger records."
+  jobId: ID!
+  runId: ID!
+  step: String!
+  status: AttemptStatus!
+  """
+  The instrument's word. A COMPLETED read whose data was lost is a FAILED
+  attempt with an error.
+  """
+  outcome: InstrumentOutcome
+  executionId: String
+  startedAt: Time
+  finishedAt: Time
+  error: String
+  dataRef: String
+  dataSha256: String
+  "Executor clock: when the attempt was committed."
+  dispatchedAt: Time!
+}
+
+"""
+One instrument. Liveness comes from its driver's status messages, every 5s,
+kept in the executor's memory only. Its work comes from the record.
+"""
+type Device {
+  id: ID!
+  "Its driver was heard from in the last 15s."
+  online: Boolean!
+  "Null when not heard from since the executor started."
+  lastSeenAt: Time
+  "The instrument's own view, from the last status message."
+  busy: Boolean!
+  instrumentJobId: String
+  "Attempts on the device (STARTED). More than one would be a bug."
+  current: [Attempt!]!
+  "Attempts waiting for the device (DISPATCHED), oldest first."
+  queued: [Attempt!]!
+}
+
+type Workflow {
+  name: String!
+  isDefault: Boolean!
+  steps: [WorkflowStep!]!
+}
+
+type WorkflowStep {
+  name: String!
+  deviceId: String!
+  dependsOn: [String!]!
+}
