@@ -21,7 +21,7 @@ MAX_ATTEMPTS=${MAX_ATTEMPTS:-3}
 # also at data_ref"). /status does not say, so it is configured here.
 DATA_DEVICES=${DATA_DEVICES:-plate-reader-1}
 # Step times in the view are RFC3339, ledger times are float seconds.
-TOL_MS=${TOL_MS:-5}
+TOL_MS=${TOL_MS:-1}
 
 pass=0; fail=0
 ok()   { printf '  PASS  %s\n' "$1"; pass=$((pass+1)); }

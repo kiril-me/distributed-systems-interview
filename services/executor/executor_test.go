@@ -237,6 +237,38 @@ func TestRetryableFailureRetriesAsNewAttempt(t *testing.T) {
 	}
 }
 
+// While a retry is on its way, the step shows nothing from the attempt that
+// failed: its times and error belong to an attempt that is no longer the last.
+func TestRetryClearsPreviousAttemptFromStep(t *testing.T) {
+	e, js := startExecutor(t)
+	second := make(chan struct{}, 1)
+	release := make(chan struct{})
+	fakeDrivers(t, js, func(cmd protocol.Command, n int) (string, bool) {
+		if cmd.Step == "b" && n == 1 {
+			return "failed", true
+		}
+		if cmd.Step == "b" && n == 2 {
+			second <- struct{}{}
+			<-release
+		}
+		return "completed", true
+	}, "lh", "inc")
+
+	runID := startRun(t, e)
+	<-second // attempt 2 of b is on the instrument
+	rv, err := e.GetRun(context.Background(), runID)
+	close(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range rv.Steps {
+		if s.Name == "b" && (s.Status != StepRunning || s.StartedAt != nil || s.FinishedAt != nil || s.Error != nil) {
+			t.Fatalf("b shows a previous attempt: %s started=%v finished=%v error=%v", s.Status, s.StartedAt, s.FinishedAt, s.Error)
+		}
+	}
+	waitFinished(t, e, runID)
+}
+
 func TestAttemptsUsedUpFailsRunAndCancelsPending(t *testing.T) {
 	e, js := startExecutor(t)
 	j := fakeDrivers(t, js, func(cmd protocol.Command, n int) (string, bool) {
@@ -253,6 +285,28 @@ func TestAttemptsUsedUpFailsRunAndCancelsPending(t *testing.T) {
 	}
 	if j.count("b") != 3 || j.count("d") != 0 {
 		t.Fatalf("b dispatched %d times, d %d times", j.count("b"), j.count("d"))
+	}
+}
+
+// Once one step has failed the run will fail, so a retryable failure on
+// another step that was still running ends it instead of starting new work.
+func TestNoRetryOnceRunIsFailing(t *testing.T) {
+	e, js := startExecutor(t)
+	j := fakeDrivers(t, js, func(cmd protocol.Command, n int) (string, bool) {
+		switch cmd.Step {
+		case "c": // lh, non-retryable: fails while b is still running
+			return "failed", false
+		case "b": // inc, retryable: fails after c has failed
+			time.Sleep(300 * time.Millisecond)
+			return "failed", true
+		}
+		return "completed", false
+	}, "lh", "inc")
+
+	rv := waitFinished(t, e, startRun(t, e))
+	got := statuses(rv)
+	if rv.Status != RunFailed || got["b"] != StepFailed || got["c"] != StepFailed || got["d"] != StepCancelled || j.count("b") != 1 {
+		t.Fatalf("run %s: %v, b dispatched %d times", rv.Status, got, j.count("b"))
 	}
 }
 

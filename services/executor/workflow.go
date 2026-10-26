@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"regexp"
 
 	"gopkg.in/yaml.v3"
 )
@@ -85,8 +86,11 @@ func (s *WorkflowSet) Get(name string) ([]StepTemplate, error) {
 func (s *WorkflowSet) Default() string { return s.def }
 func (s *WorkflowSet) Names() []string { return s.nameOrder }
 
+var safeName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
 // validateWorkflow rejects definitions that could not run: duplicate or missing
-// step names, dependencies that do not exist, and cycles.
+// step names, names unsafe in a job id or a subject, dependencies that do not
+// exist, and cycles.
 func validateWorkflow(wf workflowTemplate) error {
 	if len(wf.Steps) == 0 {
 		return fmt.Errorf("has no steps")
@@ -102,6 +106,13 @@ func validateWorkflow(wf workflowTemplate) error {
 		}
 		if st.DeviceID == "" {
 			return fmt.Errorf("step %q is missing its device", st.Name)
+		}
+		// Step names go into job ids (run/step/n), devices into NATS subjects.
+		if !safeName.MatchString(st.Name) {
+			return fmt.Errorf("step %q: name may only use letters, digits, _ and -", st.Name)
+		}
+		if !safeName.MatchString(st.DeviceID) {
+			return fmt.Errorf("step %q: device %q may only use letters, digits, _ and -", st.Name, st.DeviceID)
 		}
 		seen[st.Name] = true
 	}

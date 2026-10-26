@@ -259,8 +259,10 @@ func dispatchRun(ctx context.Context, tx *sql.Tx, runID string, r runRow) error 
 			protocol.JobID(runID, name, n), runID, name, n, device[name]); err != nil {
 			return err
 		}
+		// The new attempt is now the last one, and it has no times or error yet.
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE steps SET status = $3 WHERE run_id = $1 AND name = $2`,
+			`UPDATE steps SET status = $3, started_at = NULL, finished_at = NULL, error = NULL, data_ref = NULL
+			  WHERE run_id = $1 AND name = $2`,
 			runID, name, StepRunning); err != nil {
 			return err
 		}
@@ -354,8 +356,15 @@ func (e *Executor) applyResult(ctx context.Context, res protocol.Result) error {
 			return err // nil when it was a duplicate
 		}
 
+		var runFailing bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM steps WHERE run_id = $1 AND status = $2)`, runID, StepFailed,
+		).Scan(&runFailing); err != nil {
+			return err
+		}
+
 		// The step shows its last attempt (docs/plan.md, "Step times").
-		next := stepAfter(res, n, e.maxAttempts, r.cancelRequested)
+		next := stepAfter(res, n, e.maxAttempts, r.cancelRequested, runFailing)
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE steps SET status = $3, started_at = $4, finished_at = $5, error = $6, data_ref = $7
 			  WHERE run_id = $1 AND name = $2`,
@@ -480,9 +489,17 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
+// GetRun reads the run and its steps from one snapshot, so a commit between
+// the two queries can never show a run that disagrees with its steps.
 func (e *Executor) GetRun(ctx context.Context, runID string) (RunView, error) {
+	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return RunView{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
 	var rv RunView
-	err := e.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT id, workflow_name, status, created_at, started_at, finished_at FROM runs WHERE id = $1`,
 		runID).Scan(&rv.ID, &rv.WorkflowName, &rv.Status, &rv.CreatedAt, &rv.StartedAt, &rv.FinishedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -492,7 +509,7 @@ func (e *Executor) GetRun(ctx context.Context, runID string) (RunView, error) {
 		return RunView{}, fmt.Errorf("get run %s: %w", runID, err)
 	}
 
-	rows, err := e.db.QueryContext(ctx,
+	rows, err := tx.QueryContext(ctx,
 		`SELECT name, device_id, depends_on, status, started_at, finished_at, error, data_ref
 		   FROM steps WHERE run_id = $1 ORDER BY position`, runID)
 	if err != nil {

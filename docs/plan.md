@@ -204,13 +204,15 @@ One loop per device, commands handled one at a time:
    the ledger's `data_sha256`.
 4. A non-retryable device ran each step at most once.
 5. No device has overlapping executions in its ledger (the instrument
-   guarantees this; the record must not imply otherwise).
+   guarantees this). Two steps `running` on one device do not claim overlap:
+   `running` means on the device or queued for it.
 6. For every step, `started_at` of the first attempt is later than
    `finished_at` of every dependency's completing attempt (instrument times).
 7. Step and run statuses follow the rules above. A `cancelled` step has no
    attempts. A step with attempts is never `cancelled`.
 8. A step's `started_at` / `finished_at` in the HTTP view equal its last
-   attempt's instrument times.
+   attempt's instrument times, to 1 ms. While a new attempt is running they
+   are empty.
 9. Attempt numbers are consecutive and stay within `max_attempts`.
 
 Planned: `scripts/check_record.sh` compares `/runs/{id}` with `:7101-7103/status`.
