@@ -3,6 +3,7 @@ module github.com/automata-tech/distributed-systems-interview
 go 1.26.0
 
 require (
+	github.com/graph-gophers/graphql-go v1.10.3
 	github.com/lib/pq v1.12.3
 	github.com/minio/minio-go/v7 v7.4.1
 	github.com/nats-io/nats-server/v2 v2.10.29

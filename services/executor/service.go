@@ -45,11 +45,25 @@ type Executor struct {
 	results chan resultEvent
 	stop    context.CancelFunc
 	done    sync.WaitGroup
+
+	// What the drivers last said about their devices. In memory only: it is
+	// about now, and a restart is filled again within StatusInterval.
+	mu        sync.Mutex
+	listening time.Time             // when status messages started coming in
+	devices   map[string]deviceSeen // by device id
+	warned    map[string]bool       // job ids already logged as on an offline device
+	statusSub *nats.Subscription
 }
 
-// resultEvent hands one result to the loop and waits for it to be committed.
+type deviceSeen struct {
+	at     time.Time
+	status protocol.DeviceStatus
+}
+
+// resultEvent hands one message from the result stream to the loop and waits
+// for it to be committed.
 type resultEvent struct {
-	res     protocol.Result
+	apply   func(context.Context) error
 	applied chan error
 }
 
@@ -65,6 +79,8 @@ func NewExecutor(db *sql.DB, nc *nats.Conn, st *storage.Storage) *Executor {
 		maxAttempts: maxAttempts,
 		wake:        make(chan struct{}, 1),
 		results:     make(chan resultEvent),
+		devices:     map[string]deviceSeen{},
+		warned:      map[string]bool{},
 	}
 }
 
@@ -72,6 +88,9 @@ func NewExecutor(db *sql.DB, nc *nats.Conn, st *storage.Storage) *Executor {
 // repairing: unpublished outbox rows are published by the loop, and unacked
 // results are redelivered by JetStream.
 func (e *Executor) Start(ctx context.Context) error {
+	if err := e.migrate(ctx); err != nil {
+		return err
+	}
 	js, err := jetstream.New(e.nc)
 	if err != nil {
 		return fmt.Errorf("jetstream: %w", err)
@@ -79,14 +98,24 @@ func (e *Executor) Start(ctx context.Context) error {
 	if err := protocol.EnsureStreams(ctx, js); err != nil {
 		return err
 	}
+	kv, err := protocol.RevokedKV(ctx, js)
+	if err != nil {
+		return err
+	}
 	cons, err := protocol.ResultConsumer(ctx, js)
 	if err != nil {
 		return fmt.Errorf("result consumer: %w", err)
 	}
+	e.mu.Lock()
+	e.listening = time.Now()
+	e.mu.Unlock()
+	if e.statusSub, err = e.nc.Subscribe(protocol.StatusSubject("*"), e.onStatus); err != nil {
+		return fmt.Errorf("status: %w", err)
+	}
 
 	ctx, e.stop = context.WithCancel(ctx)
 	e.done.Add(2)
-	go func() { defer e.done.Done(); e.loop(ctx, js) }()
+	go func() { defer e.done.Done(); e.loop(ctx, js, kv) }()
 	go func() { defer e.done.Done(); e.consume(ctx, cons) }()
 	log.Printf("executor: started, max %d attempts per step", e.maxAttempts)
 	return nil
@@ -94,10 +123,81 @@ func (e *Executor) Start(ctx context.Context) error {
 
 // Close is called once, when the executor process stops.
 func (e *Executor) Close() {
+	if e.statusSub != nil {
+		_ = e.statusSub.Unsubscribe()
+	}
 	if e.stop != nil {
 		e.stop()
 		e.done.Wait()
 	}
+}
+
+// onStatus keeps a driver's latest status message.
+func (e *Executor) onStatus(msg *nats.Msg) {
+	var s protocol.DeviceStatus
+	if err := json.Unmarshal(msg.Data, &s); err != nil || s.DeviceID == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.devices[s.DeviceID] = deviceSeen{at: time.Now(), status: s}
+}
+
+// seen returns what the drivers last said, and since when the executor has
+// been listening.
+func (e *Executor) seen() (map[string]deviceSeen, time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string]deviceSeen, len(e.devices))
+	for k, v := range e.devices {
+		out[k] = v
+	}
+	return out, e.listening
+}
+
+// warnOffline logs, once, each attempt that is queued or running on a device
+// whose driver has gone quiet. The step is not changed: the device may still
+// be working, and the record waits for its ledger (ADR-2). This log line is
+// what an alert would be built on.
+func (e *Executor) warnOffline(ctx context.Context) error {
+	rows, err := e.db.QueryContext(ctx,
+		`SELECT job_id, device_id FROM attempts WHERE status IN ($1, $2)`, AttemptDispatched, AttemptStarted)
+	if err != nil {
+		return err
+	}
+	var open []openAttempt
+	for rows.Next() {
+		var a openAttempt
+		if err := rows.Scan(&a.jobID, &a.device); err != nil {
+			rows.Close()
+			return err
+		}
+		open = append(open, a)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	devices, since := e.seen()
+	lastSeen := make(map[string]time.Time, len(devices))
+	for id, d := range devices {
+		lastSeen[id] = d.at
+	}
+	now := time.Now()
+	warned := map[string]bool{}
+	for _, a := range offline(open, lastSeen, since, now) {
+		warned[a.jobID] = true
+		if !e.warned[a.jobID] {
+			heard := "never since the executor started"
+			if at, ok := lastSeen[a.device]; ok {
+				heard = now.Sub(at).Round(time.Second).String() + " ago"
+			}
+			log.Printf("executor: ALERT %s waits on %s, offline: last heard %s", a.jobID, a.device, heard)
+		}
+	}
+	e.warned = warned // only the loop touches it
+	return nil
 }
 
 // poke wakes the loop without waiting for it.
@@ -110,7 +210,7 @@ func (e *Executor) poke() {
 
 // loop is the one place that decides. After any event it dispatches what is
 // ready and publishes what is committed but not yet sent.
-func (e *Executor) loop(ctx context.Context, js jetstream.JetStream) {
+func (e *Executor) loop(ctx context.Context, js jetstream.JetStream, kv jetstream.KeyValue) {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -118,7 +218,7 @@ func (e *Executor) loop(ctx context.Context, js jetstream.JetStream) {
 		case <-ctx.Done():
 			return
 		case ev := <-e.results:
-			ev.applied <- e.applyResult(ctx, ev.res)
+			ev.applied <- ev.apply(ctx)
 		case <-e.wake:
 		case <-tick.C:
 		}
@@ -128,7 +228,65 @@ func (e *Executor) loop(ctx context.Context, js jetstream.JetStream) {
 		if err := e.publish(ctx, js); err != nil {
 			log.Printf("executor: publish: %v", err)
 		}
+		if err := e.revoke(ctx, kv); err != nil {
+			log.Printf("executor: revoke: %v", err)
+		}
+		if err := e.warnOffline(ctx); err != nil {
+			log.Printf("executor: offline check: %v", err)
+		}
 	}
+}
+
+// migrate adds what db/init.sql gained after the first deploy, so an existing
+// database keeps its runs.
+func (e *Executor) migrate(ctx context.Context) error {
+	if _, err := e.db.ExecContext(ctx, `
+		ALTER TABLE runs ADD COLUMN IF NOT EXISTS idempotency_key TEXT UNIQUE;
+		ALTER TABLE attempts ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;`); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	return nil
+}
+
+// revoke puts every queued attempt of a cancelled run in the REVOKED bucket,
+// so its driver reports it instead of running it. An attempt already on its
+// device is left alone: it ends as it physically ends. Revoking is best
+// effort; a driver that read the bucket just before still runs the job, and
+// the record says so.
+func (e *Executor) revoke(ctx context.Context, kv jetstream.KeyValue) error {
+	rows, err := e.db.QueryContext(ctx,
+		`SELECT a.job_id FROM attempts a JOIN runs r ON r.id = a.run_id
+		  WHERE r.cancel_requested AND a.status = $1 AND a.revoked_at IS NULL`, AttemptDispatched)
+	if err != nil {
+		return err
+	}
+	var jobs []string
+	for rows.Next() {
+		var job string
+		if err := rows.Scan(&job); err != nil {
+			rows.Close()
+			return err
+		}
+		jobs = append(jobs, job)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, job := range jobs {
+		putCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, err := kv.Put(putCtx, job, []byte("cancelled"))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("revoke %s: %w", job, err)
+		}
+		if _, err := e.db.ExecContext(ctx,
+			`UPDATE attempts SET revoked_at = now() WHERE job_id = $1`, job); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // consume reads results one at a time and acks each only after the loop has
@@ -138,19 +296,30 @@ func (e *Executor) consume(ctx context.Context, cons jetstream.Consumer) {
 }
 
 func (e *Executor) onResult(ctx context.Context, msg jetstream.Msg) {
-	var res protocol.Result
-	if err := json.Unmarshal(msg.Data(), &res); err != nil {
-		log.Printf("executor: dropping unreadable result: %v", err)
+	var jobID string
+	var apply func(context.Context) error
+	var err error
+	if protocol.IsStarted(msg.Subject()) {
+		var s protocol.Started
+		err = json.Unmarshal(msg.Data(), &s)
+		jobID, apply = s.JobID, func(ctx context.Context) error { return e.applyStarted(ctx, s) }
+	} else {
+		var res protocol.Result
+		err = json.Unmarshal(msg.Data(), &res)
+		jobID, apply = res.JobID, func(ctx context.Context) error { return e.applyResult(ctx, res) }
+	}
+	if err != nil {
+		log.Printf("executor: dropping unreadable %s: %v", msg.Subject(), err)
 		_ = msg.Term()
 		return
 	}
-	if _, _, _, err := protocol.ParseJobID(res.JobID); err != nil {
-		log.Printf("executor: dropping result: %v", err)
+	if _, _, _, err := protocol.ParseJobID(jobID); err != nil {
+		log.Printf("executor: dropping %s: %v", msg.Subject(), err)
 		_ = msg.Term()
 		return
 	}
 
-	ev := resultEvent{res: res, applied: make(chan error, 1)}
+	ev := resultEvent{apply: apply, applied: make(chan error, 1)}
 	select {
 	case e.results <- ev:
 	case <-ctx.Done():
@@ -158,14 +327,22 @@ func (e *Executor) onResult(ctx context.Context, msg jetstream.Msg) {
 	}
 	select {
 	case err := <-ev.applied:
+		if errors.Is(err, ErrRunNotFound) {
+			// A real result's run is committed before its command is
+			// published, so this one can never apply. Retrying it would hold
+			// up every result behind it (MaxAckPending 1).
+			log.Printf("executor: dropping %s: %v", jobID, err)
+			_ = msg.Term()
+			return
+		}
 		if err != nil {
-			log.Printf("executor: apply result %s: %v", res.JobID, err)
+			log.Printf("executor: apply %s: %v", jobID, err)
 			_ = msg.NakWithDelay(time.Second)
 			return
 		}
 		if err := msg.Ack(); err != nil {
 			// Redelivered later; applying it again changes nothing.
-			log.Printf("executor: ack result %s: %v", res.JobID, err)
+			log.Printf("executor: ack %s: %v", jobID, err)
 		}
 	case <-ctx.Done():
 	}
@@ -224,14 +401,16 @@ func (e *Executor) dispatch(ctx context.Context) error {
 		return err
 	}
 
+	// One run that cannot be dispatched must not hold up the others.
+	var errs []error
 	for _, id := range ids {
 		if err := e.withRun(ctx, id, func(tx *sql.Tx, r runRow) error {
 			return dispatchRun(ctx, tx, id, r)
 		}); err != nil {
-			return fmt.Errorf("run %s: %w", id, err)
+			errs = append(errs, fmt.Errorf("run %s: %w", id, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func dispatchRun(ctx context.Context, tx *sql.Tx, runID string, r runRow) error {
@@ -340,15 +519,19 @@ func (e *Executor) applyResult(ctx context.Context, res protocol.Result) error {
 		return err
 	}
 	return e.withRun(ctx, runID, func(tx *sql.Tx, r runRow) error {
-		started := protocol.InstrumentTime(res.StartedAt)
-		finished := protocol.InstrumentTime(res.FinishedAt)
+		// A revoked job never reached the instrument: no times, no outcome.
+		var started, finished, outcome any
+		if attemptStatus(res) != AttemptRevoked {
+			started, finished = protocol.InstrumentTime(res.StartedAt), protocol.InstrumentTime(res.FinishedAt)
+			outcome = res.Outcome
+		}
 		updated, err := tx.ExecContext(ctx,
 			`UPDATE attempts
 			    SET status = $2, execution_id = $3, outcome = $4, error = $5,
 			        started_at = $6, finished_at = $7, data_ref = $8, data_sha256 = $9
-			  WHERE job_id = $1 AND status = $10`,
-			res.JobID, attemptStatus(res), res.ExecutionID, res.Outcome, nullIfEmpty(res.Error),
-			started, finished, nullIfEmpty(res.DataRef), nullIfEmpty(res.DataSHA256), AttemptDispatched)
+			  WHERE job_id = $1 AND status IN ($10, $11)`,
+			res.JobID, attemptStatus(res), nullIfEmpty(res.ExecutionID), outcome, nullIfEmpty(res.Error),
+			started, finished, nullIfEmpty(res.DataRef), nullIfEmpty(res.DataSHA256), AttemptDispatched, AttemptStarted)
 		if err != nil {
 			return err
 		}
@@ -377,6 +560,33 @@ func (e *Executor) applyResult(ctx context.Context, res protocol.Result) error {
 			}
 		}
 		return settle(ctx, tx, runID)
+	})
+}
+
+// applyStarted records that an attempt is on its device. It applies only to a
+// dispatched attempt: a late or repeated one, after the result, changes nothing.
+func (e *Executor) applyStarted(ctx context.Context, s protocol.Started) error {
+	runID, step, _, err := protocol.ParseJobID(s.JobID)
+	if err != nil {
+		return err
+	}
+	return e.withRun(ctx, runID, func(tx *sql.Tx, _ runRow) error {
+		started := protocol.InstrumentTime(s.StartedAt)
+		updated, err := tx.ExecContext(ctx,
+			`UPDATE attempts SET status = $2, execution_id = $3, started_at = $4
+			  WHERE job_id = $1 AND status = $5`,
+			s.JobID, AttemptStarted, s.ExecutionID, started, AttemptDispatched)
+		if err != nil {
+			return err
+		}
+		if count, err := updated.RowsAffected(); err != nil || count == 0 {
+			return err
+		}
+		// A dispatched attempt is its step's last, so the step shows it.
+		_, err = tx.ExecContext(ctx,
+			`UPDATE steps SET started_at = $3 WHERE run_id = $1 AND name = $2 AND status = $4`,
+			runID, step, started, StepRunning)
+		return err
 	})
 }
 
@@ -422,7 +632,18 @@ func settle(ctx context.Context, tx *sql.Tx, runID string) error {
 	return err
 }
 
+// errKeyReused means an idempotency key already names a run of another
+// workflow.
+var errKeyReused = errors.New("idempotency key already used")
+
 func (e *Executor) CreateRun(ctx context.Context, workflowName string, steps []StepTemplate) (RunView, error) {
+	return e.createRun(ctx, workflowName, steps, "")
+}
+
+// createRun creates a run. With a key, a run created earlier with the same
+// key is returned instead, so a client may retry after a lost answer. The
+// unique index decides between two calls racing with one key.
+func (e *Executor) createRun(ctx context.Context, workflowName string, steps []StepTemplate, key string) (RunView, error) {
 	runID := "run-" + randomHex(6)
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -430,9 +651,25 @@ func (e *Executor) CreateRun(ctx context.Context, workflowName string, steps []S
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO runs (id, workflow_name) VALUES ($1, $2)`, runID, workflowName); err != nil {
+	inserted, err := tx.ExecContext(ctx,
+		`INSERT INTO runs (id, workflow_name, idempotency_key) VALUES ($1, $2, $3)
+		 ON CONFLICT (idempotency_key) DO NOTHING`, runID, workflowName, nullIfEmpty(key))
+	if err != nil {
 		return RunView{}, fmt.Errorf("insert run: %w", err)
+	}
+	if n, err := inserted.RowsAffected(); err != nil {
+		return RunView{}, err
+	} else if n == 0 {
+		var earlier, earlierWorkflow string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT id, workflow_name FROM runs WHERE idempotency_key = $1`, key,
+		).Scan(&earlier, &earlierWorkflow); err != nil {
+			return RunView{}, fmt.Errorf("run for key %q: %w", key, err)
+		}
+		if earlierWorkflow != workflowName {
+			return RunView{}, fmt.Errorf("%w by run %s of %q", errKeyReused, earlier, earlierWorkflow)
+		}
+		return e.GetRun(ctx, earlier)
 	}
 	for position, st := range steps {
 		// A nil slice would be stored as NULL, not as an empty array.
@@ -450,20 +687,40 @@ func (e *Executor) CreateRun(ctx context.Context, workflowName string, steps []S
 }
 
 func (e *Executor) StartRun(ctx context.Context, runID string) (RunView, error) {
-	if _, err := e.db.ExecContext(ctx,
+	if _, err := e.startRun(ctx, runID); err != nil {
+		return RunView{}, err
+	}
+	return e.GetRun(ctx, runID)
+}
+
+// startRun moves a pending run to running and reports whether this call did.
+func (e *Executor) startRun(ctx context.Context, runID string) (bool, error) {
+	res, err := e.db.ExecContext(ctx,
 		`UPDATE runs SET status = $1, started_at = now() WHERE id = $2 AND status = $3`,
-		RunRunning, runID, RunPending); err != nil {
-		return RunView{}, fmt.Errorf("start run %s: %w", runID, err)
+		RunRunning, runID, RunPending)
+	if err != nil {
+		return false, fmt.Errorf("start run %s: %w", runID, err)
 	}
 	e.poke()
-	return e.GetRun(ctx, runID)
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // CancelRun stops new work. Pending steps close (closePending); running steps
 // end as they physically end, because ending ctx does not stop an instrument.
 func (e *Executor) CancelRun(ctx context.Context, runID string) (RunView, error) {
+	if _, err := e.cancelRun(ctx, runID); err != nil {
+		return RunView{}, err
+	}
+	return e.GetRun(ctx, runID)
+}
+
+// cancelRun requests the cancel and reports whether this call did: false when
+// the run had already finished or a cancel was already requested.
+func (e *Executor) cancelRun(ctx context.Context, runID string) (bool, error) {
+	var cancelled bool
 	err := e.withRun(ctx, runID, func(tx *sql.Tx, r runRow) error {
-		if r.status != RunPending && r.status != RunRunning {
+		if r.status != RunPending && r.status != RunRunning || r.cancelRequested {
 			return nil
 		}
 		if _, err := tx.ExecContext(ctx,
@@ -473,13 +730,14 @@ func (e *Executor) CancelRun(ctx context.Context, runID string) (RunView, error)
 		if err := closePending(ctx, tx, runID); err != nil {
 			return err
 		}
+		cancelled = true
 		return settle(ctx, tx, runID)
 	})
 	if err != nil {
-		return RunView{}, fmt.Errorf("cancel run %s: %w", runID, err)
+		return false, fmt.Errorf("cancel run %s: %w", runID, err)
 	}
 	e.poke()
-	return e.GetRun(ctx, runID)
+	return cancelled, nil
 }
 
 func nullIfEmpty(s string) any {
@@ -492,14 +750,27 @@ func nullIfEmpty(s string) any {
 // GetRun reads the run and its steps from one snapshot, so a commit between
 // the two queries can never show a run that disagrees with its steps.
 func (e *Executor) GetRun(ctx context.Context, runID string) (RunView, error) {
+	var rv RunView
+	err := e.snapshot(ctx, func(tx *sql.Tx) (err error) {
+		rv, err = readRun(ctx, tx, runID)
+		return err
+	})
+	return rv, err
+}
+
+// snapshot runs fn in a read-only transaction that sees one moment.
+func (e *Executor) snapshot(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
-		return RunView{}, fmt.Errorf("begin: %w", err)
+		return fmt.Errorf("begin: %w", err)
 	}
 	defer tx.Rollback()
+	return fn(tx)
+}
 
+func readRun(ctx context.Context, tx *sql.Tx, runID string) (RunView, error) {
 	var rv RunView
-	err = tx.QueryRowContext(ctx,
+	err := tx.QueryRowContext(ctx,
 		`SELECT id, workflow_name, status, created_at, started_at, finished_at FROM runs WHERE id = $1`,
 		runID).Scan(&rv.ID, &rv.WorkflowName, &rv.Status, &rv.CreatedAt, &rv.StartedAt, &rv.FinishedAt)
 	if errors.Is(err, sql.ErrNoRows) {

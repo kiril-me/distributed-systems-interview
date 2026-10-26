@@ -38,7 +38,8 @@ pending ──> running ──> completed
 - `running`: an attempt was committed and published, and no final report has
   arrived. The work is on the device or on its way there. A plate-reader step
   stays `running` until its data is in S3, because the driver reports only
-  after the upload.
+  after the upload. There is no separate measurement state: lost data is a
+  failed attempt with an error.
 - `completed`: the last attempt completed on the instrument. For data-producing
   devices the object is also at `data_ref` and its sha256 matches the ledger.
 - `failed`: at least one attempt ran, and the last one failed or hung, and no
@@ -266,3 +267,9 @@ Planned: `scripts/check_record.sh` compares `/runs/{id}` with `:7101-7103/status
 - **Data lost between `Run` returning and the spool fsync** costs one retry of
   the plate reader. The attempt says `failed` while the ledger says `completed`.
   The error explains why.
+
+## Next steps
+
+- Message versioning and a contract doc for `lab.cmd.*` / `lab.result.*`.
+  For now [protocol.go](../services/common/protocol/protocol.go) and the
+  Topology section above are the contract.

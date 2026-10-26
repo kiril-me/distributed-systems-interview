@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/graph-gophers/graphql-go/relay"
 	_ "github.com/lib/pq"
 	"github.com/nats-io/nats.go"
 
@@ -75,9 +76,15 @@ func main() {
 	defer executor.Close()
 
 	api := &API{executor: executor, workflowsPath: workflowsPath}
+	routes := api.Routes()
+	schema, err := NewGraphQLSchema(executor, workflowsPath)
+	if err != nil {
+		log.Fatalf("graphql schema: %v", err)
+	}
+	routes.Handle("POST /graphql", &relay.Handler{Schema: schema})
 	srv := &http.Server{
 		Addr:              ":5001",
-		Handler:           api.Routes(),
+		Handler:           routes,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		IdleTimeout:       60 * time.Second,

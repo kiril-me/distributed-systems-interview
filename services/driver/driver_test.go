@@ -215,6 +215,78 @@ func TestBusyInstrumentIsNotAnAttempt(t *testing.T) {
 	}
 }
 
+// Once the ledger has the job, the driver says so, once, with the ledger's
+// execution id and start time: the step is on the device, not queued.
+func TestStartIsAnnouncedFromTheLedger(t *testing.T) {
+	inst := newInstrument(t, t.TempDir(), instrument.Config{Duration: 200 * time.Millisecond})
+	d := newDriver(t, inst, &fakeStore{})
+	var mu sync.Mutex
+	var got []protocol.Started
+	d.started = func(_ context.Context, s protocol.Started) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, s)
+	}
+
+	res, err := d.execute(context.Background(), command(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0].JobID != res.JobID || got[0].ExecutionID != res.ExecutionID || got[0].StartedAt != res.StartedAt {
+		t.Fatalf("announced %+v for result %+v", got, res)
+	}
+}
+
+// A job revoked while queued is not run: the instrument never sees it.
+func TestRevokedJobIsNotRun(t *testing.T) {
+	inst := newInstrument(t, t.TempDir(), instrument.Config{})
+	d := newDriver(t, inst, &fakeStore{})
+	d.revoked = func(context.Context, string) (bool, error) { return true, nil }
+
+	cmd := command(1)
+	res, err := d.execute(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != protocol.OutcomeRevoked || res.ExecutionID != "" || len(executions(inst, cmd.JobID)) != 0 {
+		t.Fatalf("unexpected result %+v, %d executions", res, len(executions(inst, cmd.JobID)))
+	}
+}
+
+// The ledger comes first: a revoked job that already ran is reported as it
+// ran, never as revoked.
+func TestRevokedJobThatRanIsReportedAsItRan(t *testing.T) {
+	inst := newInstrument(t, t.TempDir(), instrument.Config{})
+	d := newDriver(t, inst, &fakeStore{})
+	cmd := command(1)
+	if _, err := d.execute(context.Background(), cmd); err != nil {
+		t.Fatal(err)
+	}
+	d.revoked = func(context.Context, string) (bool, error) { return true, nil }
+
+	res, err := d.execute(context.Background(), cmd) // a redelivery
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != "completed" {
+		t.Fatalf("unexpected result %+v", res)
+	}
+}
+
+// If the revoked list cannot be read, nothing is decided and nothing runs.
+func TestRevokedUnreadableRunsNothing(t *testing.T) {
+	inst := newInstrument(t, t.TempDir(), instrument.Config{})
+	d := newDriver(t, inst, &fakeStore{})
+	d.revoked = func(context.Context, string) (bool, error) { return false, errors.New("nats down") }
+
+	cmd := command(1)
+	if _, err := d.execute(context.Background(), cmd); err == nil || len(executions(inst, cmd.JobID)) != 0 {
+		t.Fatalf("err %v, %d executions", err, len(executions(inst, cmd.JobID)))
+	}
+}
+
 // A read that takes longer than the driver expected still completed: its data
 // must be stored, not reported lost. Only a hang may end the wait for Run.
 func TestSlowReadKeepsItsData(t *testing.T) {
@@ -228,5 +300,32 @@ func TestSlowReadKeepsItsData(t *testing.T) {
 	}
 	if res.Outcome != "completed" || res.Error != "" || store.objects[protocol.DataKey(res.JobID)] == nil {
 		t.Fatalf("completed read lost its data: %+v", res)
+	}
+}
+
+// Spooled data that does not hash to the ledger's digest is not the data the
+// instrument produced: it is reported as an error and never put in S3.
+func TestSpoolNotMatchingLedgerIsReportedNotStored(t *testing.T) {
+	inst := newInstrument(t, t.TempDir(), instrument.Config{ProducesData: true, FailuresRetryable: true})
+	d := newDriver(t, inst, &fakeStore{})
+	cmd := command(1)
+	if _, err := d.execute(context.Background(), cmd); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(d.spoolPath(cmd.JobID), []byte("not what was read\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := &fakeStore{}
+	d.store = store
+	res, err := d.execute(context.Background(), cmd) // a redelivery finds the bad spool
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != "completed" || res.Error == "" || res.DataRef != "" || res.DataSHA256 != "" {
+		t.Fatalf("unexpected result %+v", res)
+	}
+	if len(store.objects) != 0 {
+		t.Fatalf("mismatched data was stored: %v", store.objects)
 	}
 }
